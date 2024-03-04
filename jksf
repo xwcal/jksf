@@ -1,0 +1,480 @@
+#!/usr/bin/python3
+
+########################################################################
+# jksf                                                                 #
+#                                                                      #
+# Copyright (C) 2020, 2024 Xiao Wan                                    #
+#                                                                      #
+# jksf is free software; you can redistribute it and/or modify         #
+# it under the terms of the GNU General Public License as published by #
+# the Free Software Foundation; either version 3 of the License, or    #
+# (at your option) any later version.                                  #
+#                                                                      #
+# jksf is distributed in the hope that it will be useful,              #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of       #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the        #
+# GNU General Public License for more details.                         #
+#                                                                      #
+# You should have received a copy of the GNU General Public License    #
+# along with jksf.  If not, see <http://www.gnu.org/licenses/>.        #
+########################################################################
+
+
+KMSG_FILE = '/dev/kmsg'
+LOCK_DIR = '/run/lock/jksf'
+CONF_FILE = '/etc/jksf-rules.conf'
+SEQNUM_FILE = '/run/jksf.seqnum'
+
+CHUNK = 1024
+
+import os
+import re
+import select
+import signal
+from sys import stdout, stderr
+from subprocess import run as run_proc, DEVNULL
+
+class IIE_Error(Exception):
+    pass
+class IIE_PrefixError(IIE_Error):
+    pass
+class IIE_QuotingError(IIE_Error):
+    pass
+class IIE_RegexError(IIE_Error):
+    pass
+
+class IIE_Rule:
+    def __init__(self, spec):
+        if spec.startswith('i '):
+            self._type = 'i'
+        elif spec.startswith('e '):
+            self._type = 'e'
+        else:
+            raise IIE_PrefixError(('Invalid rule (must start with "i " '+
+                                   f'or "e "): {spec}'))
+        spec_re = self._get_spec_re(spec)
+        try:
+            self._re = re.compile(spec_re)
+        except re.error as e:
+            raise IIE_RegexError(f'Invalid regex /{spec_re}/: {e}', e)
+        self._psucc = None
+        self._nsucc = None
+
+    # regex should be /quoted/ to allow possible leading or trailing spaces
+    @staticmethod
+    def _get_spec_re(spec):
+        lqi = spec.find('/', 2)
+        rqi = spec.rfind('/')
+        if lqi == -1 or lqi == rqi:
+            raise IIE_QuotingError(('The regex is not quoted like'+
+                                    f' /this/ in rule: {spec}'))
+        return spec[lqi+1:rqi]
+
+    def match(self, text):
+        return bool(self._re.search(text))
+
+# Iterative Inclusion Exclusion Filter:
+class IIE_Filter:
+    def __init__(self, rule):
+        self._head = rule
+        if rule._type == 'i':
+            self._default = False
+            self._iptail = rule
+            self._intail = rule
+            self._eptail = None
+            self._entail = None
+        else:
+            self._default = True
+            self._iptail = None
+            self._intail = None
+            self._eptail = rule
+            self._entail = rule
+        
+    def add_rule(self, rule):
+        if rule._type == 'i':
+            if self._intail:
+                self._intail._nsucc = rule
+            else:
+                self._iptail = rule
+            self._intail = rule
+            while self._eptail:
+                self._eptail._psucc = rule
+                self._eptail = self._eptail._nsucc
+        else:
+            if self._entail:
+                self._entail._nsucc = rule
+            else:
+                self._eptail = rule
+            self._entail = rule
+            while self._iptail:
+                self._iptail._psucc = rule
+                self._iptail = self._iptail._nsucc
+
+    def include(self, text):
+        ok = self._default
+        rule = self._head
+        while rule:
+            if rule.match(text):
+                rule = rule._psucc
+                ok = not ok
+            else:
+                rule = rule._nsucc
+        return ok        
+
+# use stderr to avoid mixing with kmsg entries
+def log_info(*args):
+    print(*args, file=stderr, flush=True)
+
+def log_err(*args):
+    print('Error:', *args, file=stderr, flush=True)
+
+def write_filtered(ln):
+    stdout.write(ln)
+    stdout.flush()
+
+# Could also use flock or lockf (with LOCK_NB)
+# -- see stackoverflow 22409780 and 489861
+# But mkdir is already atomic, so why bother with those?
+# Unfornately mv is not atomic (unix.stackexchange 322038)
+# or wouldn't need mkdir ...
+def acquire_filelock():
+    try:
+        os.mkdir(LOCK_DIR)
+        return True
+    except FileExistsError:
+        log_info(f'{LOCK_DIR} already exists.')
+        return False
+
+def release_filelock():
+    try:
+        os.rmdir(LOCK_DIR)
+    except IOError as e:
+        log_err(f'unable to rmdir "{LOCK_DIR}":\n{e}')
+
+def parse_conf(filename):
+    # theoretically, combining all regexs into one would allow
+    # optimization opportunities, but don't think I can rely on
+    # anything available
+    iief = None
+    try:
+        with open(filename) as f:
+            for ln in f:
+                if ln[0] == '\n' or ln[0] == '#':
+                    continue
+                try:
+                    rule = IIE_Rule(ln.rstrip())
+                except IIE_Error as e:
+                    log_err(e)
+                    exit(1)
+                if not iief:
+                    iief = IIE_Filter(rule)
+                else:
+                    iief.add_rule(rule)
+    except FileNotFoundError as e:
+        log_err(e)
+    except IOError as e:
+        log_err(e)
+        exit(1)
+    return iief
+
+def get_next_seqnum(snfile):
+    try:
+        with open(snfile) as f:
+            return int(f.read())
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        log_err(f'unexpected exception:\n{e}')
+        exit(1)
+
+def open_seqnum_file(snfile, nsn):
+    try:
+        # turn off buffering to avoid flushing
+        nsnf = open(snfile, 'wb', buffering=0)
+    except IOError as e:
+        log_err(f'unable to open "{snfile}" with "wb":\n{e}')
+        exit(1)
+    save_next_seqnum(nsn, nsnf)
+    return nsnf
+
+def maybe_open_dumpster(dumpster):
+    if not dumpster:
+        return None
+    try:
+        while os.path.exists(dumpster):
+            dumpster += '_'
+        return open(dumpster, 'w', buffering=1) # line buffering
+    except IOError as e:
+        log_err(f'unable to open "{dumpster}" or find an alternative:\n{e}')
+        exit(1)
+
+# per man systemd.service, sd_notify is needed for Type=notify
+# there is a pure python implemenation bb4242/sdnotify
+# but shell command seems simpler
+def notify_ready():
+    try:
+        run_proc(['/usr/bin/systemd-notify', 'READY=1'],
+                 stdout=DEVNULL, stderr=DEVNULL)
+    except Exception as e:
+        log_err(f'`systemd-notify READY=1\' has failed:\n{e}')
+
+def selfpipe():
+    try:
+        prfd, pwfd = os.pipe()
+    except IOError as e:
+        log_err(f'cannot create pipe:\n{e}')
+        exit(1)
+    try:
+        os.set_blocking(prfd, os.O_NONBLOCK)
+    except IOError as e:
+        log_err(f'cannot set prfd to nonblocking:\n{e}')
+        exit(1)
+    def sighdlr(sig, frame):
+        log_info(f'got signal {sig}; exiting ...')
+        os.write(pwfd, b'z')
+    return prfd, sighdlr
+
+def open_kmsg(kmsg_file):
+    try:
+        return os.open(kmsg_file, os.O_RDONLY | os.O_NONBLOCK)
+    except IOError as e:
+        log_err(f'unable to os.open "{kmsg_file}":\n{e}')
+        exit(1)
+
+def init(args):
+    if args.testmode:
+        if args.testconf:
+            iief = parse_conf(args.testconf)
+        else:
+            iief = parse_conf(CONF_FILE)
+        if args.testkmsg:
+            kmsg_file = args.testkmsg
+        else:
+            kmsg_file = KMSG_FILE
+        if args.testsnfile:
+            snfile = args.testsnfile
+        else:
+            snfile = SEQNUM_FILE
+    else:
+        iief = parse_conf(CONF_FILE)
+        kmsg_file = KMSG_FILE
+        snfile = SEQNUM_FILE
+    nsn = get_next_seqnum(snfile)
+    nsnf = open_seqnum_file(snfile, nsn)
+    dump = maybe_open_dumpster(args.dumpster)
+    prfd, sighdlr = selfpipe()
+    kmsgfd = open_kmsg(kmsg_file)
+    poller = select.poll()
+    poller.register(kmsgfd, select.POLLIN)
+    poller.register(prfd, select.POLLIN)
+    signal.signal(signal.SIGTERM, sighdlr)
+    signal.signal(signal.SIGINT, sighdlr)
+    notify_ready()
+    return iief, kmsgfd, dump, nsn, nsnf, poller
+
+def fini(kmsgfd, dump, nsnf):
+    try:
+        os.close(kmsgfd)
+        if dump:
+            dump.close()
+        nsnf.close()
+    except IOError as e:
+        log_err(f'unable to close file:\n{e}')
+
+def parse_seqnum(ln, sn):
+    try:
+        lsn = int(ln.split(',',maxsplit=2)[1])
+    except (ValueError, IndexError):
+        # assert ln[0] == ' '
+        return sn
+    if lsn != sn + 1:
+        log_err(f'seqnum != {sn}+1 in line:\n{ln}')
+    return lsn
+        
+def skip_processed(nsn):
+    sn = -1
+    while True:
+        ln = yield
+        if not ln:
+            break
+        sn = parse_seqnum(ln, sn)
+        if sn >= nsn:
+            break
+    return ln
+
+def save_next_seqnum(nsn, nsnf):
+    if nsnf.closed:
+        return
+    try:
+        nsnf.seek(0)
+        nsnf.write(str(nsn).encode('utf-8'))
+        # no need to fsync -- see:
+        # "12.5 File Operations in tmpfs" at kernel.org
+        # "The fsync operation is ... essentially a NULL operation"
+    except IOError as e:
+        log_err(f'cannot save seqnum:\n{e}')
+        try:
+            nsnf.close()
+        except IOError as e:
+            log_err(f'cannot (after write failure) close {nsnf.name}:\n{e}')
+            exit(2)
+
+def simply_forward(nsn, nsnf):
+    sn = nsn - 1
+    while True:
+        ln = yield
+        if not ln:
+            break
+        sn = parse_seqnum(ln, sn)
+        # some repetition is expected:
+        save_next_seqnum(sn, nsnf)
+        write_filtered(ln)
+
+# have to wait for the start of the next message to make
+# filtering decisions; causes delay by one message
+def filter_by_whole(iief, dump, nsn, nsnf):
+    whole = ''
+    sn = nsn - 1
+    while True:
+        ln = yield
+        if not ln:
+            break
+        if ln[0] == ' ':
+            if whole:
+                whole += ln
+            else:
+                log_info(f'Dropped: {ln.rstrip()}')
+            continue
+        if whole:
+            if iief.include(whole):
+                write_filtered(whole)
+            elif dump:
+                dump.write(whole)
+        whole = ln
+        sn = parse_seqnum(ln, sn)
+        # some repetition is expected:
+        save_next_seqnum(sn, nsnf)
+    # don't know if it's complete, but save anyway:
+    if whole:
+        if iief.include(whole):
+            write_filtered(whole)
+        elif dump:
+            dump.write(whole)
+
+def filter_by_leading(iief, dump, nsn, nsnf):
+    state = -1
+    sn = nsn - 1
+    while True:
+        ln = yield
+        if not ln:
+            break
+        if ln[0] == ' ':
+            if state == 1:
+                write_filtered(ln)
+            elif state == 0 and dump:
+                dump.write(ln)
+            elif state == -1:
+                log_info(f'Dropped: {ln.rstrip()}')
+            continue
+        if iief.include(ln):
+            state = 1
+            write_filtered(ln)
+        else:
+            state = 0
+            if dump:
+                dump.write(ln)
+        sn = parse_seqnum(ln, sn)
+        # some repetition is expected:
+        save_next_seqnum(sn, nsnf)
+
+def chain2_handover(it1, it2):
+    item = yield from it1
+    try:
+        next(it2)
+        it2.send(item)
+    except StopIteration:
+        return
+    while True:
+        item = yield
+        try:
+            it2.send(item)
+        except StopIteration:
+            break
+
+def line_iter(lp):
+    next(lp)
+    partial = b''
+    data = yield
+    while data != b'\0':
+        segs = data.split(b'\n')
+        if len(segs) == 1:
+            partial += data
+        else:
+            lp.send((partial+segs[0]+b'\n').decode('utf-8'))
+            for s in segs[1:-1]:
+                lp.send((s+b'\n').decode('utf-8'))
+            partial = segs[-1]
+        data = yield
+    if partial:
+        lp.send(partial.decode('utf-8'))
+    try:
+        lp.send('')
+    except StopIteration:
+        pass
+
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dumpster', '-d', type=str)
+    parser.add_argument('--testmode', '-t', action='store_true')
+    parser.add_argument('--testconf', '-c', type=str)
+    parser.add_argument('--testkmsg', '-f', type=str)
+    parser.add_argument('--testsnfile', '-s', type=str)
+    parser.add_argument('--wholemsg', '-w', action='store_true')
+    return parser.parse_args()
+    
+def main():
+    args = parse_args()
+    if not args.testmode and not acquire_filelock():
+        log_info('exiting ...')
+        exit(0)
+    iief, kmsgfd, dump, nsn, nsnf, poller = init(args)
+    lpskip = skip_processed(nsn)
+    if not iief:
+        lp = chain2_handover(lpskip, simply_forward(nsn, nsnf))
+    elif args.wholemsg:
+        lp = chain2_handover(lpskip, filter_by_whole(iief, dump, nsn, nsnf))
+    else:
+        lp = chain2_handover(lpskip, filter_by_leading(iief, dump, nsn, nsnf))
+    li = line_iter(lp)
+    next(li)
+    try:
+        keepon = True
+        while keepon:
+            ready = poller.poll()
+            for fd, evt in ready:
+                if fd != kmsgfd:
+                    keepon = False
+                    continue
+                while True:
+                    try:
+                        data = os.read(fd, CHUNK)
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        break
+                    li.send(data)
+        try:
+            li.send(b'\0')
+        except StopIteration:
+            pass
+    except IOError as e:
+        log_err(e)
+        exit(2)
+    finally:
+        fini(kmsgfd, dump, nsnf)
+        if not args.testmode:
+            release_filelock()
+
+if __name__ == '__main__':
+    main()

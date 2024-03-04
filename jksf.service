@@ -1,0 +1,26 @@
+[Unit]
+Description=journald kernel spam filter
+DefaultDependencies=no
+Before=systemd-journald.service
+# The following dirs need to be ready before jksf is called
+# for python3:
+RequiresMountsFor=/usr/bin
+# for jksf:
+RequiresMountsFor=/usr/local/sbin
+# for /dev/kmsg:
+RequiresMountsFor=/dev
+# for LOCK_DIR as defined in jksf:
+RequiresMountsFor=/run/lock
+# for SEQNUM_FILE as defined in jksf:
+RequiresMountsFor=/run
+# for CONF_FILE as defined in jksf:
+RequiresMountsFor=/etc
+# for /dev/shm/jksf-dump specified below:
+RequiresMountsFor=/dev/shm
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/jksf -d /dev/shm/jksf-dump
+
+[Install]
+WantedBy=systemd-journald.service
